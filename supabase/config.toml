@@ -3,10 +3,10 @@
 project_id = "voice-interview-coach"
 
 [functions.jev]
-verify_jwt = false
+verify_jwt = true
 
 [functions.interviewer]
-verify_jwt = false
+verify_jwt = true
 
 [functions.tts]
-verify_jwt = false
+verify_jwt = true

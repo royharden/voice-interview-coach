@@ -1,5 +1,32 @@
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 
+// Service-role client for the daily cap counter. Only service_role can
+// call increment_usage (EXECUTE revoked from PUBLIC, anon, authenticated).
+const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const adminClient = createClient(supabaseUrl, serviceRoleKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+const JEV_CAP = 2000;
+
+async function checkDailyCap(): Promise<boolean> {
+  try {
+    const { data, error } = await adminClient.rpc("increment_usage", {
+      p_fn: "jev",
+      p_cap: JEV_CAP,
+    });
+    if (error) {
+      console.error("increment_usage error:", error.message);
+      return false;
+    }
+    return data === true;
+  } catch (err) {
+    console.error("increment_usage failed:", err);
+    return false;
+  }
+}
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -203,6 +230,14 @@ Deno.serve(async (req: Request) => {
       state = { mode: "turn_check", question, answer_so_far: window };
       questions = TURN_CHECK_QUESTIONS;
       retries = Math.min(Math.max(body.retries ?? 2, 0), 5);
+    }
+
+    const allowed = await checkDailyCap();
+    if (!allowed) {
+      return new Response(
+        JSON.stringify({ error: "daily_cap", message: "Daily Jev call cap reached." }),
+        { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
     }
 
     const { response, latencyMs } = await callJev(state, questions, retries);

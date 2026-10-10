@@ -1,8 +1,37 @@
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+// Service-role client for the daily cap counter. Only service_role can
+// call increment_usage (EXECUTE revoked from PUBLIC, anon, authenticated).
+const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const adminClient = createClient(supabaseUrl, serviceRoleKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+const TTS_CAP = 200;
+
+async function checkDailyCap(): Promise<boolean> {
+  try {
+    const { data, error } = await adminClient.rpc("increment_usage", {
+      p_fn: "tts",
+      p_cap: TTS_CAP,
+    });
+    if (error) {
+      console.error("increment_usage error:", error.message);
+      return false;
+    }
+    return data === true;
+  } catch (err) {
+    console.error("increment_usage failed:", err);
+    return false;
+  }
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -26,6 +55,15 @@ Deno.serve(async (req: Request) => {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
+
+    const allowed = await checkDailyCap();
+    if (!allowed) {
+      return new Response(
+        JSON.stringify({ error: "daily_cap", message: "Daily TTS call cap reached." }),
+        { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     const baseUrl = Deno.env.get("OPENAI_BASE_URL") || "https://api.openai.com/v1";
     const model = Deno.env.get("OPENAI_TTS_MODEL") || "gpt-4o-mini-tts";
     const voice = Deno.env.get("OPENAI_TTS_VOICE") || "alloy";

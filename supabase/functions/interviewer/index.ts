@@ -1,8 +1,37 @@
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+// Service-role client for the daily cap counter. Only service_role can
+// call increment_usage (EXECUTE revoked from PUBLIC, anon, authenticated).
+const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const adminClient = createClient(supabaseUrl, serviceRoleKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+const INTERVIEWER_CAP = 200;
+
+async function checkDailyCap(): Promise<boolean> {
+  try {
+    const { data, error } = await adminClient.rpc("increment_usage", {
+      p_fn: "interviewer",
+      p_cap: INTERVIEWER_CAP,
+    });
+    if (error) {
+      console.error("increment_usage error:", error.message);
+      return false;
+    }
+    return data === true;
+  } catch (err) {
+    console.error("increment_usage failed:", err);
+    return false;
+  }
+}
 
 const QUESTION_BANK: Record<string, string[]> = {
   behavioral: [
@@ -164,6 +193,8 @@ Deno.serve(async (req: Request) => {
     if (mode === "questions") {
       if (!body.mock && openAiConfig().apiKey) {
         try {
+          const allowed = await checkDailyCap();
+          if (!allowed) throw new Error("daily_cap");
           const prompt = [
             `You are a senior interviewer. Generate ${body.count ?? 5} interview questions for a ${body.seniority ?? "mid-level"} ${body.role ?? "software engineer"} role.`,
             `Interview type: ${body.interview_type ?? "mixed"}.`,
@@ -198,6 +229,8 @@ Deno.serve(async (req: Request) => {
       const dim = body.target_dimension ?? "action";
       if (!body.mock && openAiConfig().apiKey) {
         try {
+          const allowed = await checkDailyCap();
+          if (!allowed) throw new Error("daily_cap");
           const prompt = [
             `You are a senior interviewer. The candidate just answered: "${body.question}".`,
             `Their answer: ${(body.answer ?? "").slice(0, 3000)}`,
@@ -220,6 +253,8 @@ Deno.serve(async (req: Request) => {
     if (mode === "feedback") {
       if (!body.mock && openAiConfig().apiKey) {
         try {
+          const allowed = await checkDailyCap();
+          if (!allowed) throw new Error("daily_cap");
           const prompt = [
             "You are an interview coach. Below are the interview turns with STAR scores (0-3 per dimension, composite 0-100).",
             JSON.stringify(body.turns ?? [], null, 1).slice(0, 8000),
