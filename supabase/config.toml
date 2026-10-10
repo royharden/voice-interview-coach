@@ -1,0 +1,12 @@
+# Supabase project config for Voice Interview Coach
+
+project_id = "voice-interview-coach"
+
+[functions.jev]
+verify_jwt = false
+
+[functions.interviewer]
+verify_jwt = false
+
+[functions.tts]
+verify_jwt = false
