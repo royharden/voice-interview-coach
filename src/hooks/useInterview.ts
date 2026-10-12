@@ -37,6 +37,10 @@ export interface ReportData {
 
 const TICK_MS = 120;
 
+// Bounds enforced by the anon INSERT policies (see the
+// restrict_data_table_writes migration).
+const DB_LIMITS = { role: 200, jobDescription: 2000, question: 1000, transcript: 20_000 };
+
 export function useInterview(config: SessionConfig) {
   const [phase, setPhase] = useState<RoomPhase>("asking");
   const [turns, setTurns] = useState<TurnState[]>([]);
@@ -82,10 +86,10 @@ export function useInterview(config: SessionConfig) {
       const { data, error } = await supabase
         .from("sessions")
         .insert({
-          role: config.role,
+          role: config.role.slice(0, DB_LIMITS.role),
           seniority: config.seniority,
           interview_type: config.interviewType,
-          job_description: config.jobDescription || null,
+          job_description: config.jobDescription.slice(0, DB_LIMITS.jobDescription) || null,
           settings: config.settings,
           interviewer_mode: config.interviewerMode,
         })
@@ -116,8 +120,8 @@ export function useInterview(config: SessionConfig) {
           session_id: sid,
           idx: turn.idx,
           kind: turn.kind,
-          question: turn.question,
-          transcript: turn.transcript || null,
+          question: turn.question.slice(0, DB_LIMITS.question),
+          transcript: turn.transcript.slice(0, DB_LIMITS.transcript) || null,
           started_at: new Date(turn.startedAt).toISOString(),
           ended_at: turn.endedAt ? new Date(turn.endedAt).toISOString() : null,
           end_reason: turn.endReason ?? null,
@@ -443,6 +447,7 @@ export function useInterview(config: SessionConfig) {
           wpm: t.wpm,
           filler_count: t.fillerCount,
         })),
+        sessionId: sessionIdRef.current,
         mock: configRef.current.interviewerMode === "mock",
       });
     } catch (err) {
@@ -456,13 +461,7 @@ export function useInterview(config: SessionConfig) {
       interruptionsAvoided,
       jevCostUsd: totalCostUsd,
     });
-
-    if (sessionIdRef.current) {
-      await supabase
-        .from("sessions")
-        .update({ overall_score: overall, feedback: feedback?.feedback ?? null })
-        .eq("id", sessionIdRef.current);
-    }
+    // The overall score and feedback are saved server-side by the feedback call.
   }, []);
 
   const endInterviewNow = useCallback(() => {

@@ -1,36 +1,222 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-// Service-role client for the daily cap counter. Only service_role can
-// call increment_usage (EXECUTE revoked from PUBLIC, anon, authenticated).
-const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const adminClient = createClient(supabaseUrl, serviceRoleKey, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
 
-const INTERVIEWER_CAP = 200;
+const FN_NAME = "interviewer";
 
-async function checkDailyCap(): Promise<boolean> {
+// Request limits, enforced before any paid call or prompt building.
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_ROLE_CHARS = 200;
+const MAX_QUESTION_CHARS = 1000;
+const MAX_ANSWER_CHARS = 3000;
+const MAX_JOB_DESCRIPTION_CHARS = 2000;
+const MAX_TURNS = 20;
+const MAX_FEEDBACK_CHARS = 8000;
+const OPENAI_TIMEOUT_MS = 30_000;
+// Sessions can only get their score/feedback saved shortly after creation.
+const SESSION_SAVE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const SENIORITIES = ["Intern", "Junior", "Mid-level", "Senior", "Staff", "Lead"] as const;
+const INTERVIEW_TYPES = ["behavioral", "technical", "mixed", "frontend", "pm", "data"] as const;
+const DIMENSIONS = ["situation", "task", "action", "result", "relevance"] as const;
+const ANSWER_TYPES = ["real_example", "hypothetical", "generic", "uncertain"] as const;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ---------------------------------------------------------------------------
+// Daily cap. Every paid OpenAI fetch is counted through increment_usage,
+// which only service_role can execute.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_DAILY_CAP = 200;
+
+function dailyCap(): number {
+  const raw = (Deno.env.get("DAILY_CALL_LIMIT") ?? "").trim();
+  if (!/^\d{1,10}$/.test(raw)) return DEFAULT_DAILY_CAP;
+  const n = Number(raw);
+  return n <= 2_147_483_647 ? n : DEFAULT_DAILY_CAP;
+}
+
+let adminClient: SupabaseClient | null = null;
+
+// Service-role client built only from env; null if either var is missing.
+function getAdminClient(): SupabaseClient | null {
+  if (adminClient) return adminClient;
+  const url = Deno.env.get("SUPABASE_URL");
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !key) return null;
+  adminClient = createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  return adminClient;
+}
+
+type CountResult = "ok" | "capped" | "error";
+
+// Fails closed: only a literal `true` from the RPC allows the call.
+async function countPaidCall(admin: SupabaseClient): Promise<CountResult> {
+  const cap = dailyCap();
+  if (cap <= 0) return "capped";
   try {
-    const { data, error } = await adminClient.rpc("increment_usage", {
-      p_fn: "interviewer",
-      p_cap: INTERVIEWER_CAP,
-    });
+    const { data, error } = await admin.rpc("increment_usage", { p_fn: FN_NAME, p_cap: cap });
     if (error) {
       console.error("increment_usage error:", error.message);
-      return false;
+      return "error";
     }
-    return data === true;
+    return data === true ? "ok" : "capped";
   } catch (err) {
     console.error("increment_usage failed:", err);
-    return false;
+    return "error";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Body parsing with a hard byte limit, and field clamping
+// ---------------------------------------------------------------------------
+
+type BodyResult =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; response: Response };
+
+async function readJsonBody(req: Request, maxBytes: number): Promise<BodyResult> {
+  const tooLarge = (): BodyResult => ({ ok: false, response: json({ error: "payload_too_large" }, 413) });
+  const declared = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > maxBytes) return tooLarge();
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (req.body) {
+    const reader = req.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return tooLarge();
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return { ok: false, response: json({ error: "invalid_json" }, 400) };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, response: json({ error: "invalid_body" }, 400) };
+  }
+  return { ok: true, body: parsed as Record<string, unknown> };
+}
+
+function clampText(value: unknown, max: number): string {
+  return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function boundedNumber(value: unknown, min: number, max: number): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max
+    ? value
+    : undefined;
+}
+
+function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  if (typeof value !== "string") return fallback;
+  const v = value.trim().toLowerCase();
+  return allowed.find((a) => a.toLowerCase() === v) ?? fallback;
+}
+
+type Dimension = (typeof DIMENSIONS)[number];
+
+interface CleanStar {
+  situation?: { score: number; confidence?: number };
+  task?: { score: number; confidence?: number };
+  action?: { score: number; confidence?: number };
+  result?: { score: number; confidence?: number };
+  relevance?: { score: number; confidence?: number };
+  ownsActions?: { noul: number };
+  answerType?: { choice: string; confidence?: number };
+}
+
+interface CleanTurn {
+  question: string;
+  kind: "question" | "follow_up";
+  transcript: string;
+  star?: CleanStar;
+  composite?: number;
+  wpm?: number;
+  filler_count?: number;
+}
+
+function sanitizeStar(value: unknown): CleanStar | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const s = value as Record<string, unknown>;
+  const star: CleanStar = {};
+  for (const dim of DIMENSIONS) {
+    const d = s[dim];
+    if (!d || typeof d !== "object") continue;
+    const score = boundedNumber((d as Record<string, unknown>).score, 0, 3);
+    if (score === undefined) continue;
+    const confidence = boundedNumber((d as Record<string, unknown>).confidence, 0, 1);
+    star[dim] = confidence === undefined ? { score } : { score, confidence };
+  }
+  const owns = s.ownsActions as Record<string, unknown> | undefined;
+  const noul = owns && typeof owns === "object" ? boundedNumber(owns.noul, 0, 1) : undefined;
+  if (noul !== undefined) star.ownsActions = { noul };
+  const at = s.answerType as Record<string, unknown> | undefined;
+  if (at && typeof at === "object" && ANSWER_TYPES.includes(at.choice as (typeof ANSWER_TYPES)[number])) {
+    const confidence = boundedNumber(at.confidence, 0, 1);
+    star.answerType = { choice: at.choice as string, ...(confidence === undefined ? {} : { confidence }) };
+  }
+  return star;
+}
+
+// Whitelists and bounds every turn field; anything else (e.g. raw Jev
+// responses) is dropped before the turns reach a prompt.
+function sanitizeTurns(value: unknown): CleanTurn[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_TURNS).flatMap((raw): CleanTurn[] => {
+    if (!raw || typeof raw !== "object") return [];
+    const t = raw as Record<string, unknown>;
+    const question = clampText(t.question, MAX_QUESTION_CHARS);
+    if (!question) return [];
+    const turn: CleanTurn = {
+      question,
+      kind: t.kind === "follow_up" ? "follow_up" : "question",
+      transcript: clampText(t.transcript, MAX_ANSWER_CHARS),
+    };
+    const star = sanitizeStar(t.star);
+    if (star) turn.star = star;
+    const composite = boundedNumber(t.composite, 0, 100);
+    if (composite !== undefined) turn.composite = composite;
+    const wpm = boundedNumber(t.wpm, 0, 100_000);
+    if (wpm !== undefined) turn.wpm = wpm;
+    const fillers = boundedNumber(t.filler_count, 0, 100_000);
+    if (fillers !== undefined) turn.filler_count = Math.round(fillers);
+    return [turn];
+  });
 }
 
 const QUESTION_BANK: Record<string, string[]> = {
@@ -89,15 +275,8 @@ function pickQuestions(interviewType: string, count: number): string[] {
   return shuffled.slice(0, count);
 }
 
-function templatedFeedback(turns: unknown[]): string {
-  const answered = turns.filter((t) => (t as { composite?: number }).composite != null) as Array<{
-    question: string;
-    transcript?: string;
-    star?: Record<string, unknown>;
-    composite?: number;
-    wpm?: number;
-    filler_count?: number;
-  }>;
+function templatedFeedback(turns: CleanTurn[]): string {
+  const answered = turns.filter((t) => t.composite != null);
   if (answered.length === 0) return "No scored answers in this session.";
 
   const labels: Record<string, string> = {
@@ -113,7 +292,7 @@ function templatedFeedback(turns: unknown[]): string {
     let total = 0;
     let n = 0;
     for (const t of answered) {
-      const dim = t.star?.[label] as { score?: number } | undefined;
+      const dim = t.star?.[label as Dimension];
       if (dim?.score != null) {
         total += dim.score;
         n++;
@@ -138,6 +317,33 @@ function templatedFeedback(turns: unknown[]): string {
   return parts.filter(Boolean).join("\n\n");
 }
 
+// Same formula as the client report: mean composite of scored turns.
+function overallScore(turns: CleanTurn[]): number | null {
+  const scored = turns.filter((t) => t.composite != null);
+  if (scored.length === 0) return null;
+  return Math.round(scored.reduce((s, t) => s + (t.composite ?? 0), 0) / scored.length);
+}
+
+// Writes the end-of-session score and feedback with the service-role client.
+// Only these two columns, only once (feedback still null), and only for a
+// recently created session; anon has no UPDATE on sessions.
+async function saveSessionResult(
+  admin: SupabaseClient,
+  sessionId: string,
+  score: number | null,
+  feedback: string,
+): Promise<void> {
+  const since = new Date(Date.now() - SESSION_SAVE_WINDOW_MS).toISOString();
+  const { error } = await admin
+    .from("sessions")
+    .update({ overall_score: score, feedback: feedback.slice(0, MAX_FEEDBACK_CHARS) })
+    .eq("id", sessionId)
+    .is("feedback", null)
+    .gte("created_at", since);
+  if (error) console.error("session save failed:", error.message);
+}
+
+// Model and base URL come only from env, never from the request.
 function openAiConfig() {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   const baseUrl = Deno.env.get("OPENAI_BASE_URL") || "https://api.openai.com/v1";
@@ -145,144 +351,167 @@ function openAiConfig() {
   return { apiKey, baseUrl, model };
 }
 
+type LlmResult =
+  | { kind: "ok"; content: string }
+  | { kind: "capped" }
+  | { kind: "counter_error" }
+  | { kind: "failed" };
+
+// One counted OpenAI fetch. No retries: on failure the caller falls back to
+// the bank/template.
 async function callOpenAi(
+  admin: SupabaseClient,
+  apiKey: string,
   messages: Array<{ role: string; content: string }>,
   maxTokens = 900,
-): Promise<string> {
-  const { apiKey, baseUrl, model } = openAiConfig();
-  if (!apiKey) throw new Error("OPENAI_API_KEY is not configured");
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.7 }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenAI HTTP ${res.status}: ${text.slice(0, 300)}`);
+): Promise<LlmResult> {
+  const { baseUrl, model } = openAiConfig();
+
+  const counted = await countPaidCall(admin);
+  if (counted === "capped") return { kind: "capped" };
+  if (counted === "error") return { kind: "counter_error" };
+
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.7 }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(`OpenAI HTTP ${res.status}:`, text.slice(0, 500));
+      return { kind: "failed" };
+    }
+    const body = await res.json();
+    const content = body?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) {
+      console.error("OpenAI returned an empty completion");
+      return { kind: "failed" };
+    }
+    return { kind: "ok", content };
+  } catch (err) {
+    console.error("OpenAI request failed:", err);
+    return { kind: "failed" };
   }
-  const json = await res.json();
-  const content = json?.choices?.[0]?.message?.content;
-  if (typeof content !== "string" || !content.trim()) throw new Error("Empty completion");
-  return content;
 }
+
+function parseQuestions(content: string): string[] | null {
+  const match = content.match(/\[[\s\S]*\]/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]);
+    if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((q) => typeof q === "string")) {
+      return parsed;
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+const counterUnavailable = () => json({ error: "usage_counter_unavailable" }, 503);
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
+  if (req.method !== "POST") {
+    return json({ error: "method_not_allowed" }, 405);
+  }
+
+  const admin = getAdminClient();
+  if (!admin) {
+    console.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set");
+    return json({ error: "server_not_configured" }, 503);
+  }
 
   try {
-    const body = (await req.json()) as {
-      mode?: string;
-      role?: string;
-      seniority?: string;
-      interview_type?: string;
-      job_description?: string;
-      count?: number;
-      question?: string;
-      answer?: string;
-      target_dimension?: string;
-      turns?: unknown[];
-      mock?: boolean;
-    };
+    const parsed = await readJsonBody(req, MAX_BODY_BYTES);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.body;
+
     const mode = body.mode ?? "questions";
+    const mock = Boolean(body.mock);
+    const apiKey = openAiConfig().apiKey;
+    const useLlm = !mock && !!apiKey;
 
     if (mode === "questions") {
-      if (!body.mock && openAiConfig().apiKey) {
-        try {
-          const allowed = await checkDailyCap();
-          if (!allowed) throw new Error("daily_cap");
-          const prompt = [
-            `You are a senior interviewer. Generate ${body.count ?? 5} interview questions for a ${body.seniority ?? "mid-level"} ${body.role ?? "software engineer"} role.`,
-            `Interview type: ${body.interview_type ?? "mixed"}.`,
-            body.job_description ? `Job description:\n${body.job_description.slice(0, 2000)}` : "",
-            "Return ONLY a JSON array of question strings, no numbering, no commentary.",
-          ]
-            .filter(Boolean)
-            .join("\n");
-          const content = await callOpenAi([{ role: "user", content }], 700);
-          const match = content.match(/\[[\s\S]*\]/);
-          const parsed = match ? JSON.parse(match[0]) : null;
-          if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((q) => typeof q === "string")) {
-            return new Response(JSON.stringify({ questions: parsed.slice(0, body.count ?? 5), source: "llm" }), {
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            });
-          }
-          throw new Error("Could not parse questions");
-        } catch (err) {
-          console.log("question generation fell back to bank:", err instanceof Error ? err.message : err);
+      const count = clampInt(body.count, 1, 10, 5);
+      const role = clampText(body.role, MAX_ROLE_CHARS) || "software engineer";
+      const seniority = oneOf(body.seniority, SENIORITIES, "Mid-level");
+      const interviewType = oneOf(body.interview_type, INTERVIEW_TYPES, "mixed");
+      const jobDescription = clampText(body.job_description, MAX_JOB_DESCRIPTION_CHARS);
+
+      if (useLlm) {
+        const prompt = [
+          `You are a senior interviewer. Generate ${count} interview questions for a ${seniority} ${role} role.`,
+          `Interview type: ${interviewType}.`,
+          jobDescription ? `Job description:\n${jobDescription}` : "",
+          "Return ONLY a JSON array of question strings, no numbering, no commentary.",
+        ]
+          .filter(Boolean)
+          .join("\n");
+        const llm = await callOpenAi(admin, apiKey, [{ role: "user", content: prompt }], 700);
+        if (llm.kind === "counter_error") return counterUnavailable();
+        const questions = llm.kind === "ok" ? parseQuestions(llm.content) : null;
+        if (questions) {
+          return json({ questions: questions.slice(0, count), source: "llm" });
         }
+        console.log("question generation fell back to bank:", llm.kind === "ok" ? "unparseable" : llm.kind);
       }
-      return new Response(
-        JSON.stringify({
-          questions: pickQuestions(body.interview_type ?? "mixed", body.count ?? 5),
-          source: "bank",
-        }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-      );
+      return json({ questions: pickQuestions(interviewType, count), source: "bank" });
     }
 
     if (mode === "follow_up") {
-      const dim = body.target_dimension ?? "action";
-      if (!body.mock && openAiConfig().apiKey) {
-        try {
-          const allowed = await checkDailyCap();
-          if (!allowed) throw new Error("daily_cap");
-          const prompt = [
-            `You are a senior interviewer. The candidate just answered: "${body.question}".`,
-            `Their answer: ${(body.answer ?? "").slice(0, 3000)}`,
-            `Write ONE short, natural spoken follow-up question that probes the ${dim} part of their story. Keep it under 30 words. Return only the question.`,
-          ].join("\n");
-          const content = await callOpenAi([{ role: "user", content }], 120);
-          return new Response(JSON.stringify({ question: content.trim(), source: "llm" }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        } catch (err) {
-          console.log("follow-up fell back to template:", err instanceof Error ? err.message : err);
+      const dim = oneOf(body.target_dimension, DIMENSIONS, "action");
+      if (useLlm) {
+        const question = clampText(body.question, MAX_QUESTION_CHARS);
+        const answer = clampText(body.answer, MAX_ANSWER_CHARS);
+        const prompt = [
+          `You are a senior interviewer. The candidate just answered: "${question}".`,
+          `Their answer: ${answer}`,
+          `Write ONE short, natural spoken follow-up question that probes the ${dim} part of their story. Keep it under 30 words. Return only the question.`,
+        ].join("\n");
+        const llm = await callOpenAi(admin, apiKey, [{ role: "user", content: prompt }], 120);
+        if (llm.kind === "counter_error") return counterUnavailable();
+        if (llm.kind === "ok") {
+          return json({ question: llm.content.trim(), source: "llm" });
         }
+        console.log("follow-up fell back to template:", llm.kind);
       }
-      return new Response(
-        JSON.stringify({ question: FOLLOW_UP_TEMPLATES[dim] ?? FOLLOW_UP_TEMPLATES.action, source: "template" }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-      );
+      return json({ question: FOLLOW_UP_TEMPLATES[dim] ?? FOLLOW_UP_TEMPLATES.action, source: "template" });
     }
 
     if (mode === "feedback") {
-      if (!body.mock && openAiConfig().apiKey) {
-        try {
-          const allowed = await checkDailyCap();
-          if (!allowed) throw new Error("daily_cap");
-          const prompt = [
-            "You are an interview coach. Below are the interview turns with STAR scores (0-3 per dimension, composite 0-100).",
-            JSON.stringify(body.turns ?? [], null, 1).slice(0, 8000),
-            "Write feedback with three labeled sections exactly: 'Strengths:', 'Top 3 improvements:' (three bullets), and 'Stronger answer:' (a rewritten stronger answer for the weakest turn, citing its scores). Be specific and cite the scores.",
-          ].join("\n");
-          const content = await callOpenAi([{ role: "user", content }], 900);
-          return new Response(JSON.stringify({ feedback: content, source: "llm" }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        } catch (err) {
-          console.log("feedback fell back to template:", err instanceof Error ? err.message : err);
-        }
+      const turns = sanitizeTurns(body.turns);
+      const sessionId =
+        typeof body.session_id === "string" && UUID_RE.test(body.session_id) ? body.session_id : null;
+
+      let result: { feedback: string; source: "llm" | "template" } | null = null;
+      if (useLlm) {
+        const prompt = [
+          "You are an interview coach. Below are the interview turns with STAR scores (0-3 per dimension, composite 0-100).",
+          JSON.stringify(turns, null, 1),
+          "Write feedback with three labeled sections exactly: 'Strengths:', 'Top 3 improvements:' (three bullets), and 'Stronger answer:' (a rewritten stronger answer for the weakest turn, citing its scores). Be specific and cite the scores.",
+        ].join("\n");
+        const llm = await callOpenAi(admin, apiKey, [{ role: "user", content: prompt }], 900);
+        if (llm.kind === "counter_error") return counterUnavailable();
+        if (llm.kind === "ok") result = { feedback: llm.content, source: "llm" };
+        else console.log("feedback fell back to template:", llm.kind);
       }
-      return new Response(
-        JSON.stringify({ feedback: templatedFeedback(body.turns ?? []), source: "template" }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-      );
+      result ??= { feedback: templatedFeedback(turns), source: "template" };
+
+      if (sessionId) await saveSessionResult(admin, sessionId, overallScore(turns), result.feedback);
+      return json(result);
     }
 
-    return new Response(JSON.stringify({ error: `Unknown mode: ${mode}` }), {
-      status: 400,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return json({ error: "unknown_mode" }, 400);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return new Response(JSON.stringify({ error: message }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    console.error("interviewer failed:", err);
+    return json({ error: "internal_error" }, 500);
   }
 });

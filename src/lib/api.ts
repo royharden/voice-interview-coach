@@ -6,12 +6,28 @@ import type {
   StarResult,
 } from "./types";
 
+// Client-side mirror of the Edge Functions' request limits, so normal use
+// never trips a 413/422 (the functions still enforce their own limits).
+const LIMITS = {
+  question: 1000,
+  jevAnswer: 12_000,
+  // Turn checks only use the last ~80 words, so only send the tail.
+  turnCheckTail: 2000,
+  role: 200,
+  jobDescription: 2000,
+  llmAnswer: 3000,
+  feedbackTurns: 20,
+  // interviewer rejects bodies over 64 KB
+  feedbackBodyBytes: 60 * 1024,
+};
+
 const url = import.meta.env.VITE_SUPABASE_URL as string;
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
 function fnHeaders(): HeadersInit {
   return {
     Authorization: `Bearer ${anonKey}`,
+    apikey: anonKey,
     "Content-Type": "application/json",
   };
 }
@@ -42,7 +58,15 @@ export async function jevTurnCheck(
   answerSoFar: string,
   signal?: AbortSignal,
 ): Promise<JevCheckResult> {
-  return postJson<JevCheckResult>("jev", { mode: "turn_check", question, answer_so_far: answerSoFar }, signal);
+  return postJson<JevCheckResult>(
+    "jev",
+    {
+      mode: "turn_check",
+      question: question.slice(0, LIMITS.question),
+      answer_so_far: answerSoFar.slice(-LIMITS.turnCheckTail),
+    },
+    signal,
+  );
 }
 
 export interface JevStarRaw {
@@ -54,7 +78,11 @@ export interface JevStarRaw {
 }
 
 export async function jevScore(question: string, answer: string): Promise<JevStarRaw> {
-  return postJson<JevStarRaw>("jev", { mode: "star_score", question, answer });
+  return postJson<JevStarRaw>("jev", {
+    mode: "star_score",
+    question: question.slice(0, LIMITS.question),
+    answer: answer.slice(0, LIMITS.jevAnswer),
+  });
 }
 
 export async function generateQuestions(opts: {
@@ -65,7 +93,12 @@ export async function generateQuestions(opts: {
   count: number;
   mock: boolean;
 }): Promise<InterviewQuestionsResult> {
-  return postJson<InterviewQuestionsResult>("interviewer", { mode: "questions", ...opts });
+  return postJson<InterviewQuestionsResult>("interviewer", {
+    mode: "questions",
+    ...opts,
+    role: opts.role.slice(0, LIMITS.role),
+    jobDescription: opts.jobDescription.slice(0, LIMITS.jobDescription),
+  });
 }
 
 export async function generateFollowUp(opts: {
@@ -76,18 +109,52 @@ export async function generateFollowUp(opts: {
 }): Promise<FollowUpResult> {
   return postJson<FollowUpResult>("interviewer", {
     mode: "follow_up",
-    question: opts.question,
-    answer: opts.answer,
+    question: opts.question.slice(0, LIMITS.question),
+    answer: opts.answer.slice(0, LIMITS.llmAnswer),
     target_dimension: opts.targetDimension,
     mock: opts.mock,
   });
 }
 
+export interface FeedbackTurn {
+  question: string;
+  kind: string;
+  transcript: string;
+  star?: StarResult;
+  composite?: number;
+  wpm?: number;
+  filler_count?: number;
+}
+
+/**
+ * Final feedback. When sessionId is set, the interviewer function also saves
+ * the session's overall score and feedback (anon cannot UPDATE sessions).
+ */
 export async function generateFeedback(opts: {
-  turns: unknown[];
+  turns: FeedbackTurn[];
+  sessionId: string | null;
   mock: boolean;
 }): Promise<FeedbackResult> {
-  return postJson<FeedbackResult>("interviewer", { mode: "feedback", turns: opts.turns, mock: opts.mock });
+  // Drop raw Jev responses and shrink long transcripts until the body fits.
+  const build = (maxChars: number) => ({
+    mode: "feedback",
+    mock: opts.mock,
+    session_id: opts.sessionId ?? undefined,
+    turns: opts.turns.slice(0, LIMITS.feedbackTurns).map(({ star, ...t }) => ({
+      ...t,
+      question: t.question.slice(0, Math.min(LIMITS.question, maxChars)),
+      transcript: t.transcript.slice(0, maxChars),
+      star: star && { ...star, raw: undefined },
+    })),
+  });
+  const bytes = (body: unknown) => new TextEncoder().encode(JSON.stringify(body)).length;
+  let maxChars = LIMITS.llmAnswer;
+  let body = build(maxChars);
+  while (maxChars > 100 && bytes(body) > LIMITS.feedbackBodyBytes) {
+    maxChars = Math.floor(maxChars / 2);
+    body = build(maxChars);
+  }
+  return postJson<FeedbackResult>("interviewer", body);
 }
 
 export async function openAiTts(text: string): Promise<ArrayBuffer> {

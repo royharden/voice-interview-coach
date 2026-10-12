@@ -68,7 +68,25 @@ Use **Chrome** — its Web Speech implementation is the most reliable. Firefox h
 | `OPENAI_MODEL` | Edge Function secret (optional) | Default `gpt-6-luna` |
 | `OPENAI_TTS_MODEL` | Edge Function secret (optional) | Default `gpt-4o-mini-tts` |
 | `OPENAI_TTS_VOICE` | Edge Function secret (optional) | Default `alloy` |
+| `DAILY_CALL_LIMIT` | Edge Function secret (optional) | Paid upstream calls per function per UTC day. Default `200`; `0` disables paid calls |
 | `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` | Frontend env | Supabase client for persistence |
+
+Without `TYPESAFE_API_KEY` / `OPENAI_API_KEY` the app still runs: turn-taking and scoring
+fall back to the heuristic, questions come from the built-in bank, follow-ups and feedback
+use templates, and speech uses the browser voice.
+
+## Security notes
+
+- All three functions require a JWT (`verify_jwt = true`); the browser sends the anon key.
+- Every paid upstream fetch (Jev, OpenAI chat, OpenAI TTS), retries included, is counted
+  first via `increment_usage` (SECURITY DEFINER, executable only by `service_role`). The
+  counter fails closed: a counter error returns 503, and over the cap returns 429
+  `daily_limit` (the interviewer falls back to its bank/templates instead).
+- Request limits: 64 KB bodies (8 KB for `tts`), bounded fields, and at most 20 turns per
+  feedback request.
+- The browser can only `SELECT` and `INSERT` (size-bounded) on `sessions`, `turns` and
+  `turn_checks`. The session's overall score and feedback are saved by the `interviewer`
+  function with the service-role key.
 
 ## Screens
 
